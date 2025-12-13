@@ -1,0 +1,49 @@
+{
+  "name": "ganymede",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Jupiter swap SDK with x402 micropayment-gated premium features",
+  "author": "Ganymede",
+  "license": "MIT",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "clean": "rm -rf dist .turbo node_modules",
+    "type-check": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "keywords": [
+    "jupiter",
+    "solana",
+    "swap",
+    "x402",
+    "micropayments",
+    "defi"
+  ],
+  "dependencies": {
+    "@jup-ag/api": "^6.0.46",
+    "@solana/web3.js": "^1.95.0",
+    "@solana/wallet-adapter-base": "^0.9.23"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "tsup": "^8.0.2",
+    "typescript": "^5.5.0"
+  },
+  "peerDependencies": {
+    "@solana/web3.js": "^1.95.0"
+  }
+}
