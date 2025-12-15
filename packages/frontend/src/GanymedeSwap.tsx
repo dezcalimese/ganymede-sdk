@@ -1,11 +1,17 @@
-import { useState } from 'react';
+import { useState, useMemo } from 'react';
+import { useWallet, useConnection } from '@solana/wallet-adapter-react';
+import { useUnifiedWalletContext } from '@jup-ag/wallet-adapter';
+import { GanymedeClient, type SwapResult } from 'ganymede';
 import {
   ArrowDown,
   ShieldCheck,
   Activity,
   ChevronDown,
   Cpu,
-  MoveRight
+  MoveRight,
+  Wallet,
+  LogOut,
+  AlertCircle
 } from 'lucide-react';
 
 // --- Mock Data & SDK Simulation ---
@@ -13,87 +19,23 @@ import {
 interface Token {
   symbol: string;
   name: string;
+  mint: string;
   icon: string;
   image?: string;
+  decimals: number;
   price: number;
   color: string;
 }
 
 const TOKENS: Token[] = [
-  { symbol: 'SOL', name: 'Solana', icon: '◎', image: 'tokens/solana.svg', price: 145.20, color: 'bg-indigo-600' },
-  { symbol: 'USDC', name: 'USD Coin', icon: '$', image: 'tokens/usdc.svg', price: 1.00, color: 'bg-blue-600' },
-  { symbol: 'BONK', name: 'Bonk', icon: '🐕', image: 'tokens/bonk.svg', price: 0.000024, color: 'bg-orange-600' },
-  { symbol: 'JUP', name: 'Jupiter', icon: '🪐', image: 'tokens/jup.svg', price: 1.12, color: 'bg-emerald-600' },
+  { symbol: 'SOL', name: 'Solana', mint: 'So11111111111111111111111111111111111111112', icon: '◎', image: 'tokens/solana.svg', decimals: 9, price: 145.20, color: 'bg-indigo-600' },
+  { symbol: 'USDC', name: 'USD Coin', mint: 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v', icon: '$', image: 'tokens/usdc.svg', decimals: 6, price: 1.00, color: 'bg-blue-600' },
+  { symbol: 'BONK', name: 'Bonk', mint: 'DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263', icon: '🐕', image: 'tokens/bonk.svg', decimals: 5, price: 0.000024, color: 'bg-orange-600' },
+  { symbol: 'JUP', name: 'Jupiter', mint: 'JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN', icon: '🪐', image: 'tokens/jup.svg', decimals: 6, price: 1.12, color: 'bg-emerald-600' },
 ];
 
-interface SwapParams {
-  inputMint: string;
-  outputMint: string;
-  inputPrice: number;
-  outputPrice: number;
-  amount: number;
-}
-
-interface QuoteData {
-  inputAmount: number;
-  outputAmount: number;
-  priceImpact: number;
-  route: string[];
-  type: 'standard' | 'premium';
-  mevAnalysis?: {
-    riskScore: string;
-    attackProbability: string;
-    sandwichProtection: string;
-  };
-  priorityFee?: {
-    tier: string;
-    saved: string;
-    optimalFee: number;
-  };
-  analytics?: {
-    bestRouteFound: boolean;
-    comparisonCount: number;
-    marketDepth: string;
-  };
-}
-
-const mockGanymedeSwap = async (params: SwapParams, isPremium: boolean): Promise<QuoteData> => {
-  return new Promise((resolve) => {
-    setTimeout(() => {
-      const baseResponse = {
-        inputAmount: params.amount,
-        outputAmount: (params.amount * params.inputPrice) / params.outputPrice,
-        priceImpact: 0.05,
-        route: [params.inputMint, 'Raydium', 'Orca', params.outputMint],
-      };
-
-      if (!isPremium) {
-        resolve({ ...baseResponse, type: 'standard' });
-        return;
-      }
-
-      resolve({
-        ...baseResponse,
-        type: 'premium',
-        mevAnalysis: {
-          riskScore: 'Low',
-          attackProbability: '1.2%',
-          sandwichProtection: 'Active'
-        },
-        priorityFee: {
-          tier: 'Turbo',
-          saved: '$0.45',
-          optimalFee: 0.0001
-        },
-        analytics: {
-          bestRouteFound: true,
-          comparisonCount: 14,
-          marketDepth: 'High'
-        }
-      });
-    }, 1500);
-  });
-};
+// Server URL - change to your deployed server for production
+const GANYMEDE_SERVER_URL = import.meta.env.VITE_GANYMEDE_SERVER_URL || 'http://localhost:3001';
 
 interface TokenSelectorProps {
   selected: Token;
@@ -154,47 +96,92 @@ const TokenSelector = ({ selected, onSelect, tokens, label }: TokenSelectorProps
 };
 
 export default function GanymedeSwap() {
+  const { publicKey, connected, disconnect, wallet } = useWallet();
+  const { connection } = useConnection();
+  const { setShowModal } = useUnifiedWalletContext();
+
   const [payToken, setPayToken] = useState(TOKENS[0]);
   const [receiveToken, setReceiveToken] = useState(TOKENS[1]);
   const [amount, setAmount] = useState('1');
   const [isPremium, setIsPremium] = useState(true);
-  const [swapState, setSwapState] = useState<'idle' | 'quoting' | 'success'>('idle');
-  const [quoteData, setQuoteData] = useState<QuoteData | null>(null);
+  const [swapState, setSwapState] = useState<'idle' | 'quoting' | 'success' | 'error'>('idle');
+  const [swapResult, setSwapResult] = useState<SwapResult | null>(null);
   const [x402Status, setX402Status] = useState('');
+  const [error, setError] = useState<string | null>(null);
+
+  // Truncate wallet address for display
+  const truncatedAddress = publicKey
+    ? `${publicKey.toBase58().slice(0, 4)}...${publicKey.toBase58().slice(-4)}`
+    : null;
+
+  // Create Ganymede client when wallet is connected
+  const ganymedeClient = useMemo(() => {
+    if (!wallet?.adapter || !connection) return null;
+    return new GanymedeClient({
+      wallet: wallet.adapter,
+      connection,
+      apiEndpoint: GANYMEDE_SERVER_URL,
+      enablePremium: true,
+      network: 'devnet',
+    });
+  }, [wallet?.adapter, connection]);
 
   const handleSwap = async () => {
+    if (!ganymedeClient) return;
+
     setSwapState('quoting');
-    setQuoteData(null);
+    setSwapResult(null);
+    setError(null);
     setX402Status('INITIALIZING');
 
-    if (isPremium) {
-      setTimeout(() => setX402Status('402 PAYMENT REQUIRED'), 600);
-      setTimeout(() => setX402Status('SIGNING MICROPAYMENT'), 1400);
-      setTimeout(() => setX402Status('VERIFIED'), 2200);
-    }
+    try {
+      // Convert amount to smallest units (lamports for SOL, etc.)
+      const amountInSmallestUnit = Math.floor(
+        parseFloat(amount || '0') * Math.pow(10, payToken.decimals)
+      );
 
-    const data = await mockGanymedeSwap({
-      inputMint: payToken.symbol,
-      outputMint: receiveToken.symbol,
-      inputPrice: payToken.price,
-      outputPrice: receiveToken.price,
-      amount: parseFloat(amount || '0')
-    }, isPremium);
+      if (isPremium) {
+        // Show x402 flow status
+        setX402Status('FETCHING QUOTE');
 
-    if (isPremium) {
-      setTimeout(() => {
-        setQuoteData(data);
+        const result = await ganymedeClient.getEnhancedSwap({
+          inputMint: payToken.mint,
+          outputMint: receiveToken.mint,
+          amount: amountInSmallestUnit,
+          mevProtection: true,
+          optimizePriorityFee: true,
+          includeAnalytics: true,
+        });
+
+        // Update status based on whether payment was made
+        if (result.paymentTxHash) {
+          setX402Status('PAYMENT VERIFIED');
+        }
+
+        setSwapResult(result);
         setSwapState('success');
-      }, 3000);
-    } else {
-      setQuoteData(data);
-      setSwapState('success');
+      } else {
+        // Free tier - just get quote
+        const result = await ganymedeClient.buildSwap({
+          inputMint: payToken.mint,
+          outputMint: receiveToken.mint,
+          amount: amountInSmallestUnit,
+        });
+
+        setSwapResult(result);
+        setSwapState('success');
+      }
+    } catch (err) {
+      console.error('Swap error:', err);
+      setError(err instanceof Error ? err.message : 'Unknown error');
+      setSwapState('error');
     }
   };
 
   const reset = () => {
     setSwapState('idle');
-    setQuoteData(null);
+    setSwapResult(null);
+    setError(null);
   };
 
   return (
@@ -263,9 +250,9 @@ export default function GanymedeSwap() {
                 <div>
                   <TokenSelector label="Receive" selected={receiveToken} onSelect={setReceiveToken} tokens={TOKENS} />
                   <div className="mt-4 px-4 font-mono tracking-tighter text-5xl text-right">
-                     {quoteData && swapState === 'success' ? (
+                     {swapResult?.quote && swapState === 'success' ? (
                        <span className="text-emerald-400 animate-in fade-in slide-in-from-bottom-2 block">
-                         {quoteData.outputAmount.toFixed(4)}
+                         {(parseInt(swapResult.quote.outAmount) / Math.pow(10, receiveToken.decimals)).toFixed(4)}
                        </span>
                      ) : (
                        <span className="text-slate-600">
@@ -309,20 +296,34 @@ export default function GanymedeSwap() {
             </div>
 
             {/* Action Button */}
-            <button
-              onClick={swapState === 'success' ? reset : handleSwap}
-              disabled={swapState === 'quoting'}
-              className={`w-full py-6 font-bold text-sm tracking-[0.2em] uppercase transition-all duration-300
-                ${swapState === 'quoting'
-                  ? 'bg-zinc-900 text-zinc-600 cursor-not-allowed'
+            {!connected ? (
+              <button
+                onClick={() => setShowModal(true)}
+                className="w-full py-6 font-bold text-sm tracking-[0.2em] uppercase transition-all duration-300 bg-white text-black hover:bg-indigo-500 hover:text-white"
+              >
+                Select Wallet
+              </button>
+            ) : (
+              <button
+                onClick={swapState === 'success' ? reset : handleSwap}
+                disabled={swapState === 'quoting'}
+                className={`w-full py-6 font-bold text-sm tracking-[0.2em] uppercase transition-all duration-300
+                  ${swapState === 'quoting'
+                    ? 'bg-zinc-900 text-zinc-600 cursor-not-allowed'
+                    : swapState === 'success'
+                      ? 'bg-emerald-500 text-black hover:bg-emerald-400'
+                      : 'bg-white text-black hover:bg-indigo-500 hover:text-white'
+                  }
+                `}
+              >
+                {swapState === 'quoting'
+                  ? 'Processing x402'
                   : swapState === 'success'
-                    ? 'bg-emerald-500 text-black hover:bg-emerald-400'
-                    : 'bg-white text-black hover:bg-indigo-500 hover:text-white'
+                    ? 'Swap Complete'
+                    : 'Execute Swap'
                 }
-              `}
-            >
-              {swapState === 'quoting' ? 'Processing x402' : swapState === 'success' ? 'Swap Complete' : 'Execute Swap'}
-            </button>
+              </button>
+            )}
           </div>
         </div>
 
@@ -350,18 +351,25 @@ export default function GanymedeSwap() {
                    </h4>
                    <p className="text-xs text-slate-500 mt-1 font-mono">Front-running defense system</p>
                  </div>
-                 {quoteData?.mevAnalysis && <span className="text-2xl font-mono text-emerald-400">{quoteData.mevAnalysis.riskScore}</span>}
+                 {swapResult?.mevAnalysis && (
+                   <span className="text-2xl font-mono text-emerald-400">
+                     {swapResult.mevAnalysis.riskScore < 30 ? 'Low' : swapResult.mevAnalysis.riskScore < 60 ? 'Med' : 'High'}
+                   </span>
+                 )}
                </div>
+               {swapResult?.mevAnalysis && (
+                 <p className="text-xs text-slate-400 font-mono">{swapResult.mevAnalysis.recommendation}</p>
+               )}
                <div className="absolute right-0 top-0 w-32 h-32 bg-emerald-500/5 rounded-full blur-2xl -mr-10 -mt-10 group-hover:bg-emerald-500/10 transition-colors" />
             </div>
 
             {/* Card 2: Priority Fee */}
             <div className="lg:ml-auto bg-gradient-to-l from-zinc-900 to-transparent border-r-2 border-amber-500 p-6 max-w-md w-full text-right relative overflow-hidden group">
                <div className="flex justify-end items-start mb-4 relative z-10 gap-4">
-                 {quoteData?.priorityFee && (
+                 {swapResult?.recommendedPriorityFee && (
                    <div className="text-right">
-                     <span className="text-2xl font-mono text-amber-400 block">{quoteData.priorityFee.tier}</span>
-                     <span className="text-xs text-green-500 font-mono">Saved {quoteData.priorityFee.saved}</span>
+                     <span className="text-2xl font-mono text-amber-400 block">{swapResult.recommendedPriorityFee.tier}</span>
+                     <span className="text-xs text-green-500 font-mono">${swapResult.recommendedPriorityFee.costInUsd.toFixed(4)}</span>
                    </div>
                  )}
                  <div className="text-right">
@@ -372,6 +380,9 @@ export default function GanymedeSwap() {
                    <p className="text-xs text-slate-500 mt-1 font-mono">Dynamic fee optimization</p>
                  </div>
                </div>
+               {swapResult?.recommendedPriorityFee && (
+                 <p className="text-xs text-slate-400 font-mono text-right">{swapResult.recommendedPriorityFee.estimatedLandingTime}</p>
+               )}
                <div className="absolute left-0 bottom-0 w-32 h-32 bg-amber-500/5 rounded-full blur-2xl -ml-10 -mb-10 group-hover:bg-amber-500/10 transition-colors" />
             </div>
 
@@ -383,30 +394,76 @@ export default function GanymedeSwap() {
                      <Cpu className="w-4 h-4 text-cyan-500" />
                      Route Analytics
                    </h4>
-                   <p className="text-xs text-slate-500 mt-1 font-mono">Multi-hop pathway logic</p>
+                   <p className="text-xs text-slate-500 mt-1 font-mono">
+                     {swapResult?.routeAnalytics
+                       ? `${swapResult.routeAnalytics.summary.totalHops} hops via ${swapResult.routeAnalytics.summary.dexesUsed.join(', ')}`
+                       : 'Multi-hop pathway logic'
+                     }
+                   </p>
                  </div>
                </div>
-                {quoteData && (
+                {swapResult?.routeAnalytics ? (
+                  <div className="flex items-center gap-2 text-xs font-mono text-slate-400 mt-2 flex-wrap">
+                    {swapResult.routeAnalytics.breakdown.map((step: { dex: string }, i: number) => (
+                      <span key={i} className="flex items-center gap-1">
+                        {i > 0 && <MoveRight className="w-3 h-3 text-cyan-500" />}
+                        <span className={i === 0 || i === swapResult.routeAnalytics!.breakdown.length - 1 ? 'text-white' : ''}>
+                          {step.dex}
+                        </span>
+                      </span>
+                    ))}
+                  </div>
+                ) : (
                   <div className="flex items-center gap-2 text-xs font-mono text-slate-400 mt-2">
                      <span className="text-white">{payToken.symbol}</span>
                      <MoveRight className="w-3 h-3 text-cyan-500" />
-                     <span>Raydium</span>
-                     <MoveRight className="w-3 h-3 text-cyan-500" />
-                     <span>Orca</span>
+                     <span>DEX</span>
                      <MoveRight className="w-3 h-3 text-cyan-500" />
                      <span className="text-white">{receiveToken.symbol}</span>
                   </div>
                 )}
             </div>
 
+            {/* Error display */}
+            {swapState === 'error' && error && (
+              <div className="lg:-ml-12 bg-gradient-to-r from-red-900/50 to-transparent border-l-2 border-red-500 p-6 max-w-md w-full">
+                <div className="flex items-start gap-3">
+                  <AlertCircle className="w-5 h-5 text-red-500 flex-shrink-0 mt-0.5" />
+                  <div>
+                    <h4 className="text-white font-medium">Error</h4>
+                    <p className="text-xs text-red-400 font-mono mt-1">{error}</p>
+                  </div>
+                </div>
+              </div>
+            )}
+
           </div>
 
           {/* Connect Wallet */}
           <div className="absolute top-10 right-10">
-            <button className="group flex items-center gap-3 px-6 py-3 bg-transparent border border-white/20 hover:border-white text-white font-mono text-xs tracking-widest uppercase transition-all">
-              <span>Connect Wallet</span>
-              <div className="w-2 h-2 bg-indigo-500 rounded-full group-hover:animate-ping" />
-            </button>
+            {connected ? (
+              <div className="flex items-center gap-3">
+                <div className="flex items-center gap-2 px-4 py-3 bg-white/5 border border-white/10 text-white font-mono text-xs tracking-widest">
+                  <Wallet className="w-4 h-4 text-emerald-400" />
+                  <span>{truncatedAddress}</span>
+                </div>
+                <button
+                  onClick={() => disconnect()}
+                  className="p-3 bg-transparent border border-white/20 hover:border-red-500 hover:bg-red-500/10 text-white transition-all"
+                  title="Disconnect"
+                >
+                  <LogOut className="w-4 h-4" />
+                </button>
+              </div>
+            ) : (
+              <button
+                onClick={() => setShowModal(true)}
+                className="flex items-center gap-3 px-6 py-3 bg-transparent border border-white/20 hover:border-white text-white font-mono text-xs tracking-widest uppercase transition-all"
+              >
+                <Wallet className="w-4 h-4" />
+                Connect
+              </button>
+            )}
           </div>
 
         </div>

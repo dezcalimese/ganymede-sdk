@@ -1,19 +1,30 @@
 import express, { type Express, type Request, type Response, type NextFunction } from 'express';
 import cors from 'cors';
 import { config } from 'dotenv';
+import { resolve } from 'path';
+import { fileURLToPath } from 'url';
 
 import healthRoutes from './routes/health.js';
 import premiumRoutes from './routes/premium.js';
 import { paymentMiddleware, type PricingConfig } from './middleware/x402.js';
 
-// Load environment variables
-config();
+// Load environment variables from monorepo root
+const __dirname = fileURLToPath(new URL('.', import.meta.url));
+config({ path: resolve(__dirname, '../../../.env') });
 
 const app: Express = express();
 const PORT = process.env.PORT || 3001;
 
 // Middleware
-app.use(cors());
+app.use(cors({
+  origin: true,
+  exposedHeaders: [
+    'Payment-Required',
+    'X-Payment-Required',
+    'X-Payment-Response',
+    'X-Payment-TxHash',
+  ],
+}));
 app.use(express.json());
 
 // Request logging
