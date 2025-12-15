@@ -1,6 +1,7 @@
-import { useState, useMemo } from 'react';
+import { useState, useMemo, useEffect } from 'react';
 import { useWallet, useConnection } from '@solana/wallet-adapter-react';
 import { useUnifiedWalletContext } from '@jup-ag/wallet-adapter';
+import { LAMPORTS_PER_SOL } from '@solana/web3.js';
 import { GanymedeClient, type SwapResult } from 'ganymede';
 import {
   ArrowDown,
@@ -108,6 +109,33 @@ export default function GanymedeSwap() {
   const [swapResult, setSwapResult] = useState<SwapResult | null>(null);
   const [x402Status, setX402Status] = useState('');
   const [error, setError] = useState<string | null>(null);
+  const [balance, setBalance] = useState<number | null>(null);
+
+  // Detect if we're on devnet
+  const isDevnet = connection.rpcEndpoint.includes('devnet');
+
+  // Fetch wallet balance
+  useEffect(() => {
+    if (!publicKey || !connection) {
+      setBalance(null);
+      return;
+    }
+
+    const fetchBalance = async () => {
+      try {
+        const lamports = await connection.getBalance(publicKey);
+        setBalance(lamports / LAMPORTS_PER_SOL);
+      } catch (err) {
+        console.error('Failed to fetch balance:', err);
+        setBalance(null);
+      }
+    };
+
+    fetchBalance();
+    // Refresh balance every 30 seconds
+    const interval = setInterval(fetchBalance, 30000);
+    return () => clearInterval(interval);
+  }, [publicKey, connection]);
 
   // Truncate wallet address for display
   const truncatedAddress = publicKey
@@ -443,9 +471,19 @@ export default function GanymedeSwap() {
           <div className="absolute top-10 right-10">
             {connected ? (
               <div className="flex items-center gap-3">
-                <div className="flex items-center gap-2 px-4 py-3 bg-white/5 border border-white/10 text-white font-mono text-xs tracking-widest">
+                {isDevnet && (
+                  <div className="px-2 py-1 bg-amber-500/20 border border-amber-500/50 text-amber-400 font-mono text-[10px] tracking-widest uppercase">
+                    Devnet
+                  </div>
+                )}
+                <div className="flex items-center gap-3 px-4 py-3 bg-white/5 border border-white/10 text-white font-mono text-xs tracking-widest">
                   <Wallet className="w-4 h-4 text-emerald-400" />
                   <span>{truncatedAddress}</span>
+                  {balance !== null && (
+                    <span className="text-slate-400 border-l border-white/10 pl-3">
+                      {balance.toFixed(4)} SOL
+                    </span>
+                  )}
                 </div>
                 <button
                   onClick={() => disconnect()}
