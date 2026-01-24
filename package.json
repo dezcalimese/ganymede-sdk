@@ -12,19 +12,27 @@
     "type-check": "turbo run type-check",
     "test": "turbo run test",
     "clean": "turbo run clean && rm -rf node_modules",
-    "format": "prettier --write \"**/*.{ts,tsx,md,json}\""
+    "format": "prettier --write \"**/*.{ts,tsx,md,json}\"",
+    "security:audit": "pnpm dedupe --check && pnpm audit --prod --audit-level=high",
+    "security:audit-fix": "pnpm audit --prod --audit-level=high --fix",
+    "security:deps": "pnpm dedupe && pnpm list --depth=0",
+    "security:verify": "pnpm dedupe --check && pnpm audit --prod --audit-level=medium"
   },
   "devDependencies": {
-    "@types/node": "^20.11.0",
-    "prettier": "^3.2.5",
-    "tsup": "^8.0.2",
-    "turbo": "^2.0.0",
-    "typescript": "^5.5.0",
-    "vitest": "^2.0.0"
+    "@types/node": "20.11.0",
+    "prettier": "3.2.5",
+    "tsup": "8.0.2",
+    "turbo": "2.0.0",
+    "typescript": "5.5.3",
+    "vitest": "2.0.0"
   },
   "packageManager": "pnpm@9.15.0",
   "engines": {
     "node": ">=18.0.0",
     "pnpm": ">=9.0.0"
+  },
+  "pnpm": {
+    "dedupe": true,
+    "resolutionMode": "highest"
   }
 }

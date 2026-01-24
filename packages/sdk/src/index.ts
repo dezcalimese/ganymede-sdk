@@ -62,6 +62,9 @@ export type { QuoteResponse } from '@jup-ag/api';
 export type { Connection, VersionedTransaction, PublicKey } from '@solana/web3.js';
 export type { WalletAdapter } from '@solana/wallet-adapter-base';
 
+// Utility functions for advanced usage
+export { getLatestBlockhash } from './client.js';
+
 // Common token addresses for convenience
 export const TOKENS = {
   /** Native SOL (wrapped) */

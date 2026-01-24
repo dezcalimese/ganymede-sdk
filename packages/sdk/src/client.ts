@@ -1,5 +1,9 @@
 import { createJupiterApiClient, type QuoteGetRequest, type QuoteResponse } from '@jup-ag/api';
-import { Connection, VersionedTransaction, type Transaction } from '@solana/web3.js';
+import {
+  Connection,
+  VersionedTransaction,
+  type Transaction,
+} from '@solana/web3.js';
 import {
   type GanymedeConfig,
   type SwapParams,
@@ -26,6 +30,131 @@ const DEFAULT_MAX_PAYMENT = 0.01;
 
 /** Default slippage in basis points (0.5%) */
 const DEFAULT_SLIPPAGE_BPS = 50;
+
+/** Default compute unit limit for swaps */
+const DEFAULT_COMPUTE_UNIT_LIMIT = 200_000;
+
+/** Maximum retry attempts for transactions */
+const MAX_RETRY_ATTEMPTS = 3;
+
+/** Base delay for exponential backoff (ms) */
+const BASE_RETRY_DELAY = 500;
+
+/** Maximum retry delay (ms) */
+const MAX_RETRY_DELAY = 5000;
+
+/**
+ * Blockhash data with expiration info
+ */
+interface BlockhashData {
+  blockhash: string;
+  lastValidBlockHeight: number;
+}
+
+/**
+ * Fetches latest blockhash with expiration height
+ */
+async function getLatestBlockhash(connection: Connection): Promise<BlockhashData> {
+  const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash('confirmed');
+  return { blockhash, lastValidBlockHeight };
+}
+
+/**
+ * Waits for transaction confirmation with proper error handling
+ */
+async function confirmTransaction(
+  connection: Connection,
+  txid: string,
+  commitment: 'confirmed' | 'finalized' = 'confirmed'
+): Promise<boolean> {
+  const confirmation = await connection.confirmTransaction(
+    { signature: txid, ...await getLatestBlockhash(connection) },
+    commitment
+  );
+
+  if (confirmation.value.err) {
+    throw new GanymedeError(
+      GanymedeErrorCode.SWAP_FAILED,
+      `Transaction failed: ${JSON.stringify(confirmation.value.err)}`
+    );
+  }
+
+  return true;
+}
+
+/**
+ * Checks if transaction has expired based on block height
+ */
+async function hasTransactionExpired(
+  connection: Connection,
+  lastValidBlockHeight: number
+): Promise<boolean> {
+  const currentBlockHeight = await connection.getBlockHeight('confirmed');
+  return currentBlockHeight > lastValidBlockHeight;
+}
+
+/**
+ * Exponential backoff delay calculator
+ */
+function getRetryDelay(attempt: number): number {
+  const delay = BASE_RETRY_DELAY * Math.pow(2, attempt);
+  return Math.min(delay, MAX_RETRY_DELAY);
+}
+
+/**
+ * Sends transaction with retry logic and proper error handling
+ */
+async function sendTransactionWithRetry(
+  connection: Connection,
+  serializedTransaction: Uint8Array,
+  blockhashData: BlockhashData
+): Promise<string> {
+  let lastError: Error | null = null;
+
+  for (let attempt = 0; attempt <= MAX_RETRY_ATTEMPTS; attempt++) {
+    try {
+      // Check if transaction has expired before sending
+      if (await hasTransactionExpired(connection, blockhashData.lastValidBlockHeight)) {
+        throw new GanymedeError(
+          GanymedeErrorCode.SWAP_FAILED,
+          'Transaction blockhash has expired. Please rebuild the transaction.'
+        );
+      }
+
+      const txid = await connection.sendRawTransaction(serializedTransaction, {
+        skipPreflight: false, // Keep preflight checks for better error detection
+        maxRetries: 0, // Manual retry control
+        preflightCommitment: 'confirmed',
+      });
+
+      // Wait for confirmation
+      await confirmTransaction(connection, txid, 'confirmed');
+
+      return txid;
+    } catch (error) {
+      lastError = error as Error;
+
+      // If this is a blockhash expired error, don't retry
+      if (lastError.message.includes('blockhash has expired')) {
+        throw lastError;
+      }
+
+      // If we've exhausted retries, give up
+      if (attempt >= MAX_RETRY_ATTEMPTS) {
+        throw new GanymedeError(
+          GanymedeErrorCode.SWAP_FAILED,
+          `Transaction failed after ${MAX_RETRY_ATTEMPTS} retry attempts: ${lastError.message}`,
+          lastError
+        );
+      }
+
+      // Wait before retrying with exponential backoff
+      await new Promise(resolve => setTimeout(resolve, getRetryDelay(attempt)));
+    }
+  }
+
+  throw lastError;
+}
 
 /**
  * GanymedeClient - Jupiter swap SDK with x402 micropayment-gated premium features
@@ -126,9 +255,10 @@ export class GanymedeClient {
     } catch (error) {
       if (error instanceof GanymedeError) throw error;
 
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
       throw new GanymedeError(
         GanymedeErrorCode.QUOTE_FAILED,
-        `Failed to get quote: ${error instanceof Error ? error.message : 'Unknown error'}`,
+        `Failed to get quote: ${errorMessage}`,
         error
       );
     }
@@ -162,9 +292,10 @@ export class GanymedeClient {
         quote,
       };
     } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
       throw new GanymedeError(
         GanymedeErrorCode.SWAP_FAILED,
-        `Failed to build swap transaction: ${error instanceof Error ? error.message : 'Unknown error'}`,
+        `Failed to build swap transaction: ${errorMessage}`,
         error
       );
     }
@@ -247,18 +378,20 @@ export class GanymedeClient {
     } catch (error) {
       if (error instanceof GanymedeError) throw error;
 
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
       throw new GanymedeError(
         GanymedeErrorCode.NETWORK_ERROR,
-        `Failed to fetch premium swap: ${error instanceof Error ? error.message : 'Unknown error'}`,
+        `Failed to fetch premium swap: ${errorMessage}`,
         error
       );
     }
   }
 
   /**
-   * Executes a swap transaction
+   * Executes a swap transaction with robust error handling and retry logic
    *
-   * Signs and sends the transaction, then waits for confirmation.
+   * Signs and sends the transaction with proper compute unit settings,
+   * then waits for confirmation with automatic retry on failure.
    *
    * @param result - The swap result containing the transaction to execute
    * @returns The transaction signature
@@ -278,35 +411,24 @@ export class GanymedeClient {
       // Sign the transaction
       const signed = await wallet.signTransaction(result.transaction);
 
-      // Send the transaction
-      const txid = await this.config.connection.sendRawTransaction(
+      // Get fresh blockhash for sending
+      const blockhashData = await getLatestBlockhash(this.config.connection);
+
+      // Send with retry logic
+      const txid = await sendTransactionWithRetry(
+        this.config.connection,
         signed.serialize(),
-        {
-          skipPreflight: true,
-          maxRetries: 2,
-        }
+        blockhashData
       );
-
-      // Wait for confirmation
-      const confirmation = await this.config.connection.confirmTransaction(
-        txid,
-        'confirmed'
-      );
-
-      if (confirmation.value.err) {
-        throw new GanymedeError(
-          GanymedeErrorCode.SWAP_FAILED,
-          `Transaction failed: ${JSON.stringify(confirmation.value.err)}`
-        );
-      }
 
       return txid;
     } catch (error) {
       if (error instanceof GanymedeError) throw error;
 
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
       throw new GanymedeError(
         GanymedeErrorCode.SWAP_FAILED,
-        `Failed to execute swap: ${error instanceof Error ? error.message : 'Unknown error'}`,
+        `Failed to execute swap: ${errorMessage}`,
         error
       );
     }
@@ -324,3 +446,6 @@ export class GanymedeClient {
     return { txid, result };
   }
 }
+
+// Re-export utilities for external use
+export { getLatestBlockhash };
